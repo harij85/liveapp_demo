@@ -1,14 +1,29 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useReducer, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import './streaming.css';
 
-const STREAM_STATES = {
-  CONNECTING: 'connecting',
-  PLAYING: 'playing',
-  TEAMS: 'teams',
-  HOLD: 'hold',
+// --- Phases & Actions ---
+const PHASES = {
+  CONNECTING: 'CONNECTING',
+  PLAYING: 'PLAYING',
+  SWITCHING: 'SWITCHING',
+  HOLD: 'HOLD',
 };
 
+const ACTIONS = {
+  CONNECT: 'CONNECT',
+  PLAY_STARTED: 'PLAY_STARTED',
+  AUTOPLAY_BLOCKED: 'AUTOPLAY_BLOCKED',
+  RETRY: 'RETRY',
+  SWITCH_START: 'SWITCH_START',
+  SWITCH_READY: 'SWITCH_READY',
+  SWITCH_COMPLETE: 'SWITCH_COMPLETE',
+  HOLD: 'HOLD',
+  PROBE_SUCCESS: 'PROBE_SUCCESS',
+  SWITCH_ABORT: 'SWITCH_ABORT',
+};
+
+// --- Constants ---
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 4000;
 const STALL_TIMEOUT = 20000;
@@ -17,400 +32,522 @@ const BACKGROUND_RETRY_DELAY = 30000;
 const STABILITY_WINDOW = 15000;
 const STABLE_THRESHOLD = 60000;
 const STABLE_MIN_FRAGS = 10;
+const SWITCH_TIMEOUT = 15000;
+const CROSSFADE_MS = 600;
 
+// --- Reducer ---
+const initialState = {
+  phase: PHASES.CONNECTING,
+  activeSource: 'primary',
+  standbySource: null,
+  activeSlot: 'A',
+  crossfading: false,
+  retryCount: 0,
+  needsUserInteraction: false,
+};
+
+function streamReducer(state, action) {
+  switch (action.type) {
+    case ACTIONS.CONNECT:
+      return {
+        ...state,
+        phase: PHASES.CONNECTING,
+        activeSource: action.source,
+        standbySource: null,
+        crossfading: false,
+        needsUserInteraction: false,
+      };
+
+    case ACTIONS.PLAY_STARTED:
+      return { ...state, phase: PHASES.PLAYING, needsUserInteraction: false };
+
+    case ACTIONS.AUTOPLAY_BLOCKED:
+      return { ...state, phase: PHASES.PLAYING, needsUserInteraction: true };
+
+    case ACTIONS.RETRY:
+      return { ...state, phase: PHASES.CONNECTING, retryCount: state.retryCount + 1 };
+
+    case ACTIONS.SWITCH_START:
+      return { ...state, phase: PHASES.SWITCHING, standbySource: action.source, crossfading: false };
+
+    case ACTIONS.SWITCH_READY:
+      return { ...state, crossfading: true };
+
+    case ACTIONS.SWITCH_COMPLETE:
+      return {
+        ...state,
+        phase: PHASES.PLAYING,
+        activeSource: state.standbySource,
+        standbySource: null,
+        activeSlot: state.activeSlot === 'A' ? 'B' : 'A',
+        crossfading: false,
+        retryCount: 0,
+        needsUserInteraction: false,
+      };
+
+    case ACTIONS.SWITCH_ABORT:
+      return { ...state, phase: PHASES.PLAYING, standbySource: null, crossfading: false };
+
+    case ACTIONS.HOLD:
+      return {
+        ...state,
+        phase: PHASES.HOLD,
+        activeSource: 'hold',
+        standbySource: null,
+        crossfading: false,
+        retryCount: 0,
+      };
+
+    case ACTIONS.PROBE_SUCCESS:
+      return {
+        ...state,
+        phase: PHASES.CONNECTING,
+        activeSource: action.source,
+        standbySource: null,
+        crossfading: false,
+        retryCount: 0,
+      };
+
+    default:
+      return state;
+  }
+}
+
+// --- Pure helpers ---
+const selectBestCandidate = (failedSources, stabilityMap, urlMap) => {
+  return ['primary', 'secondary', 'tertiary']
+    .filter(s => !failedSources.has(s) && urlMap[s])
+    .sort((a, b) => {
+      const aMs = stabilityMap[a] || 0;
+      const bMs = stabilityMap[b] || 0;
+      const aStable = aMs >= STABLE_THRESHOLD;
+      const bStable = bMs >= STABLE_THRESHOLD;
+      if (aStable !== bStable) return bStable - aStable;
+      return bMs - aMs;
+    });
+};
+
+const getSourceLabel = (source) => {
+  const labels = {
+    primary: 'Primary (Amazon IVS)',
+    secondary: 'Backup (MUX)',
+    tertiary: 'Backup (MediaPackage)',
+    hold: 'None active',
+  };
+  return labels[source] || source;
+};
+
+const getStatusLabel = (phase, needsInteraction) => {
+  if (phase === PHASES.CONNECTING) return 'Connecting...';
+  if (phase === PHASES.PLAYING) return needsInteraction ? 'Ready' : 'Live';
+  if (phase === PHASES.SWITCHING) return 'Live (switching)';
+  if (phase === PHASES.HOLD) return 'Standby';
+  return 'Unknown';
+};
+
+const getStatusClass = (phase) => {
+  if (phase === PHASES.CONNECTING) return 'status-connecting';
+  if (phase === PHASES.PLAYING || phase === PHASES.SWITCHING) return 'status-connected';
+  if (phase === PHASES.HOLD) return 'status-hold';
+  return '';
+};
+
+// Cache-bust playlist requests so CDN edge nodes serve fresh manifests
+// instead of stale cached content when a stream is cut
+const bustPlaylistCache = (xhr, url) => {
+  if (url.includes('.m3u8')) {
+    const sep = url.includes('?') ? '&' : '?';
+    xhr.open('GET', `${url}${sep}_cb=${Date.now()}`, true);
+  }
+};
+
+// --- HLS configs ---
+const HLS_CONFIG = {
+  enableWorker: true,
+  lowLatencyMode: false,
+  backBufferLength: 60,
+  maxBufferLength: 30,
+  maxMaxBufferLength: 60,
+  maxBufferSize: 60 * 1000 * 1000,
+  maxBufferHole: 1.0,
+  startLevel: -1,
+  abrEwmaDefaultEstimate: 500000,
+  abrBandWidthFactor: 0.8,
+  abrBandWidthUpFactor: 0.4,
+  fragLoadingTimeOut: 20000,
+  fragLoadingMaxRetry: 6,
+  fragLoadingRetryDelay: 2000,
+  manifestLoadingTimeOut: 20000,
+  manifestLoadingMaxRetry: 4,
+  levelLoadingTimeOut: 20000,
+  levelLoadingMaxRetry: 4,
+  xhrSetup: bustPlaylistCache,
+};
+
+const PROBE_HLS_CONFIG = {
+  enableWorker: false,
+  startLevel: 0,
+  manifestLoadingTimeOut: 10000,
+  manifestLoadingMaxRetry: 1,
+  levelLoadingTimeOut: 10000,
+  levelLoadingMaxRetry: 1,
+  fragLoadingTimeOut: 15000,
+  fragLoadingMaxRetry: 2,
+  maxBufferLength: 10,
+  maxMaxBufferLength: 15,
+  xhrSetup: bustPlaylistCache,
+};
+
+// =============================================================================
+// Component
+// =============================================================================
 function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug = true }) {
-  const videoRef = useRef(null);
-  const hlsRef = useRef(null);
-  const retryCountRef = useRef(0);
-  const currentSourceRef = useRef('primary');
-  const stallTimerRef = useRef(null);
-  const retryTimerRef = useRef(null);
-  const streamStateRef = useRef(STREAM_STATES.CONNECTING);
-  const bufferErrorCountRef = useRef(0);
-  const lastFragLoadTimeRef = useRef(Date.now());
-  const probeHlsRef = useRef([]);
-  const playbackStartTimeRef = useRef(null);
-  const probeTimerRef = useRef(null);
-  const sourceStabilityRef = useRef({ primary: 0, secondary: 0, tertiary: 0 });
-  const failedSourcesRef = useRef(new Set());
-  const nativeListenersRef = useRef([]);
-  const probeVideosRef = useRef([]);
-  const heartbeatTimerRef = useRef(null);
-  const lastCurrentTimeRef = useRef(0);
-  const maxCurrentTimeRef = useRef(0);
-  const loopCountRef = useRef(0);
-  const tabVisibleRef = useRef(true);
+  const [state, dispatch] = useReducer(streamReducer, initialState);
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
-  const [streamState, setStreamState] = useState(STREAM_STATES.CONNECTING);
-  const [currentSource, setCurrentSource] = useState('primary');
-  const [needsUserInteraction, setNeedsUserInteraction] = useState(false);
   const [isDebugExpanded, setIsDebugExpanded] = useState(true);
   const [logs, setLogs] = useState([]);
-  const [retryDisplay, setRetryDisplay] = useState(0);
+  const [showTeams, setShowTeams] = useState(false);
 
-  const updateStreamState = (state) => {
-    streamStateRef.current = state;
-    setStreamState(state);
-  };
+  // Dual video slots
+  const videoSlotARef = useRef(null);
+  const videoSlotBRef = useRef(null);
+  const hlsSlotARef = useRef(null);
+  const hlsSlotBRef = useRef(null);
+  const listenersSlotARef = useRef([]);
+  const listenersSlotBRef = useRef([]);
+  const bufErrSlotARef = useRef(0);
+  const bufErrSlotBRef = useRef(0);
+  const stallSlotARef = useRef(null);
+  const stallSlotBRef = useRef(null);
 
-  const updateSource = (source) => {
-    currentSourceRef.current = source;
-    setCurrentSource(source);
-  };
+  // Shared
+  const retryTimerRef = useRef(null);
+  const heartbeatRef = useRef(null);
+  const switchTimerRef = useRef(null);
+  const lastFragTimeRef = useRef(Date.now());
+  const playStartRef = useRef(null);
+  const lastCTRef = useRef(0);
+  const maxCTRef = useRef(0);
+  const loopCntRef = useRef(0);
+  const tabVisRef = useRef(true);
+  const mountedRef = useRef(true);
 
+  // Probe
+  const probeHlsRef = useRef([]);
+  const probeTimerRef = useRef(null);
+  const probeVidsRef = useRef([]);
+
+  // Stability
+  const stabilityRef = useRef({ primary: 0, secondary: 0, tertiary: 0 });
+  const failedRef = useRef(new Set());
+
+  const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
+
+  // --- Slot helpers ---
+  const slot = (s) => ({
+    video: s === 'A' ? videoSlotARef : videoSlotBRef,
+    hls: s === 'A' ? hlsSlotARef : hlsSlotBRef,
+    listeners: s === 'A' ? listenersSlotARef : listenersSlotBRef,
+    bufErr: s === 'A' ? bufErrSlotARef : bufErrSlotBRef,
+    stall: s === 'A' ? stallSlotARef : stallSlotBRef,
+  });
+
+  const standbySlot = () => stateRef.current.activeSlot === 'A' ? 'B' : 'A';
+
+  // --- Logging ---
   const addLog = (message, type = 'info') => {
+    if (!mountedRef.current) return;
     const time = new Date().toLocaleTimeString('en-GB', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
     setLogs(prev => [...prev.slice(-19), { time, message, type }]);
   };
 
-  const clearTimers = () => {
-    if (stallTimerRef.current) {
-      clearTimeout(stallTimerRef.current);
-      stallTimerRef.current = null;
-    }
-    if (retryTimerRef.current) {
-      clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
-    if (heartbeatTimerRef.current) {
-      clearInterval(heartbeatTimerRef.current);
-      heartbeatTimerRef.current = null;
-    }
-  };
-
-  const destroyHls = () => {
-    clearTimers();
-    destroyProbe();
-    nativeListenersRef.current.forEach(({ element, event, handler }) => {
+  // --- Cleanup ---
+  const destroySlot = (s) => {
+    const r = slot(s);
+    if (r.stall.current) { clearTimeout(r.stall.current); r.stall.current = null; }
+    r.listeners.current.forEach(({ element, event, handler }) => {
       element.removeEventListener(event, handler);
     });
-    nativeListenersRef.current = [];
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
+    r.listeners.current = [];
+    r.bufErr.current = 0;
+    if (r.hls.current) { r.hls.current.destroy(); r.hls.current = null; }
+    if (r.video.current) { r.video.current.removeAttribute('src'); r.video.current.load(); }
   };
 
-  const attemptPlayback = async () => {
-    if (!videoRef.current) return false;
+  const clearShared = () => {
+    if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+    if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
+    if (switchTimerRef.current) { clearTimeout(switchTimerRef.current); switchTimerRef.current = null; }
+  };
+
+  const destroyProbe = () => {
+    if (probeTimerRef.current) { clearTimeout(probeTimerRef.current); probeTimerRef.current = null; }
+    probeHlsRef.current.forEach(p => { try { p.destroy(); } catch (e) { /* */ } });
+    probeHlsRef.current = [];
+    probeVidsRef.current.forEach(v => { v.removeAttribute('src'); v.load(); });
+    probeVidsRef.current = [];
+  };
+
+  const destroyAll = () => { clearShared(); destroySlot('A'); destroySlot('B'); destroyProbe(); };
+
+  // --- Heartbeat ---
+  const startHeartbeat = () => {
+    if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+    lastCTRef.current = 0;
+    maxCTRef.current = 0;
+    loopCntRef.current = 0;
+
+    heartbeatRef.current = setInterval(() => {
+      if (!mountedRef.current) return;
+      const s = stateRef.current;
+      if (s.phase !== PHASES.PLAYING && s.phase !== PHASES.SWITCHING) return;
+      if (!tabVisRef.current) return;
+
+      const v = slot(s.activeSlot).video.current;
+      if (!v) return;
+      const ct = v.currentTime;
+
+      if (lastCTRef.current > 0 && ct === lastCTRef.current) {
+        addLog('Heartbeat: playback frozen', 'warning');
+        const r = slot(s.activeSlot);
+        r.bufErr.current += 2;
+        if (r.bufErr.current >= BUFFER_ERROR_THRESHOLD) {
+          r.bufErr.current = 0;
+          handleError(s.activeSlot, 'Stream frozen — video not advancing', true);
+        }
+      } else if (maxCTRef.current > 0 && ct < maxCTRef.current - 3) {
+        loopCntRef.current += 1;
+        addLog(`Cache loop detected — time jumped back (${Math.round(ct)}s < ${Math.round(maxCTRef.current)}s, count: ${loopCntRef.current})`, 'warning');
+        if (loopCntRef.current >= 2) {
+          loopCntRef.current = 0;
+          handleError(stateRef.current.activeSlot, 'Stream looping cached content — source likely offline', true);
+        }
+      } else {
+        lastCTRef.current = ct;
+        if (ct > maxCTRef.current) { maxCTRef.current = ct; loopCntRef.current = 0; }
+      }
+    }, 5000);
+  };
+
+  // --- Playback ---
+  const attemptPlay = async (s) => {
+    const v = slot(s).video.current;
+    if (!v) return false;
 
     try {
-      await videoRef.current.play();
-      setNeedsUserInteraction(false);
-      updateStreamState(STREAM_STATES.PLAYING);
+      await v.play();
+      if (!mountedRef.current) return false;
+      dispatch({ type: ACTIONS.PLAY_STARTED });
       addLog('Stream playing successfully', 'success');
+      startHeartbeat();
       return true;
-    } catch (error) {
-      if (error?.name === 'NotAllowedError') {
-        setNeedsUserInteraction(true);
-        updateStreamState(STREAM_STATES.PLAYING);
+    } catch (err) {
+      if (!mountedRef.current) return false;
+      if (err?.name === 'NotAllowedError') {
+        dispatch({ type: ACTIONS.AUTOPLAY_BLOCKED });
         addLog('Click required to start playback', 'warning');
+        startHeartbeat();
         return true;
       }
-      addLog(`Playback failed: ${error.message}`, 'error');
+      addLog(`Playback failed: ${err.message}`, 'error');
       return false;
     }
   };
 
-  const destroyProbe = () => {
-    if (probeTimerRef.current) {
-      clearTimeout(probeTimerRef.current);
-      probeTimerRef.current = null;
+  // --- Error handling ---
+  const handleError = (errorSlot, msg, isFatal = true) => {
+    if (!mountedRef.current) return;
+    addLog(msg, 'error');
+    if (!isFatal) return;
+
+    const s = stateRef.current;
+
+    // Error on standby during switching → abort switch, try next
+    if (s.phase === PHASES.SWITCHING && errorSlot !== s.activeSlot) {
+      addLog('Standby source failed — aborting switch', 'warning');
+      if (switchTimerRef.current) { clearTimeout(switchTimerRef.current); switchTimerRef.current = null; }
+      destroySlot(errorSlot);
+      dispatch({ type: ACTIONS.SWITCH_ABORT });
+
+      failedRef.current.add(s.standbySource);
+      const next = selectBestCandidate(failedRef.current, stabilityRef.current, urlMap);
+      if (next.length > 0) {
+        addLog(`Trying ${next[0]} instead...`, 'warning');
+        setTimeout(() => {
+          if (!mountedRef.current) return;
+          initStandby(urlMap[next[0]], next[0]);
+        }, RETRY_DELAY);
+      }
+      return;
     }
-    probeHlsRef.current.forEach(p => {
-      try { p.destroy(); } catch (e) { /* ignore */ }
-    });
-    probeHlsRef.current = [];
-    probeVideosRef.current.forEach(v => {
-      v.removeAttribute('src');
-      v.load();
-    });
-    probeVideosRef.current = [];
+
+    // Error on active slot
+    const source = s.activeSource;
+    const retries = s.retryCount;
+
+    if (retries < MAX_RETRIES) {
+      dispatch({ type: ACTIONS.RETRY });
+      addLog(`Retrying ${source} stream (attempt ${retries + 1}/${MAX_RETRIES})...`, 'warning');
+      clearShared();
+      destroySlot(s.activeSlot);
+
+      retryTimerRef.current = setTimeout(() => {
+        if (!mountedRef.current) return;
+        initStream(urlMap[source], source, stateRef.current.activeSlot);
+      }, RETRY_DELAY);
+    } else {
+      if (playStartRef.current) {
+        const elapsed = Date.now() - playStartRef.current;
+        stabilityRef.current[source] = Math.max(stabilityRef.current[source] || 0, elapsed);
+        addLog(`${source} was stable for ${Math.round(elapsed / 1000)}s`, 'info');
+      }
+      failedRef.current.add(source);
+
+      const candidates = selectBestCandidate(failedRef.current, stabilityRef.current, urlMap);
+
+      if (candidates.length > 0) {
+        const next = candidates[0];
+        const stab = stabilityRef.current[next] || 0;
+        const label = stab >= STABLE_THRESHOLD
+          ? `most stable (${Math.round(stab / 1000)}s uptime)` : 'next available';
+        addLog(`Switching to ${next} — ${label}`, 'warning');
+
+        if (s.phase === PHASES.PLAYING || s.phase === PHASES.SWITCHING) {
+          initStandby(urlMap[next], next);
+        } else {
+          destroySlot(s.activeSlot);
+          dispatch({ type: ACTIONS.CONNECT, source: next });
+          initStream(urlMap[next], next, s.activeSlot);
+        }
+      } else {
+        failedRef.current.clear();
+        goHold();
+      }
+    }
   };
 
-  const scheduleBackgroundRetry = () => {
-    if (retryTimerRef.current) {
-      clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
+  // --- Hold ---
+  const goHold = () => {
+    destroyAll();
+    addLog('All streams unavailable. Showing hold screen.', 'error');
+    dispatch({ type: ACTIONS.HOLD });
+    scheduleProbe();
+  };
+
+  // --- Background probe ---
+  const scheduleProbe = () => {
+    if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
 
     retryTimerRef.current = setTimeout(() => {
-      const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
-      const candidates = Object.entries(urlMap).filter(([, url]) => url);
-
+      if (!mountedRef.current) return;
+      const cands = Object.entries(urlMap).filter(([, u]) => u);
       destroyProbe();
 
-      if (candidates.length === 0 || !Hls.isSupported()) {
-        scheduleBackgroundRetry();
-        return;
-      }
+      if (cands.length === 0 || !Hls.isSupported()) { scheduleProbe(); return; }
 
-      addLog(`Probing ${candidates.length} stream source(s)...`, 'info');
-      const fragCounts = {};
+      addLog(`Probing ${cands.length} stream source(s)...`, 'info');
+      const frags = {};
       let resolved = false;
 
-      candidates.forEach(([source, url]) => {
-        fragCounts[source] = 0;
-        const probe = new Hls({
-          enableWorker: false,
-          startLevel: 0,
-          manifestLoadingTimeOut: 10000,
-          manifestLoadingMaxRetry: 1,
-          levelLoadingTimeOut: 10000,
-          levelLoadingMaxRetry: 1,
-          fragLoadingTimeOut: 15000,
-          fragLoadingMaxRetry: 2,
-          maxBufferLength: 10,
-          maxMaxBufferLength: 15,
-        });
+      cands.forEach(([src, url]) => {
+        frags[src] = 0;
+        const probe = new Hls(PROBE_HLS_CONFIG);
         probeHlsRef.current.push(probe);
-
-        const probeVideo = document.createElement('video');
-        probeVideosRef.current.push(probeVideo);
+        const pv = document.createElement('video');
+        probeVidsRef.current.push(pv);
         probe.loadSource(url);
-        probe.attachMedia(probeVideo);
-
-        probe.on(Hls.Events.FRAG_LOADED, () => {
-          fragCounts[source] += 1;
-        });
-
-        probe.on(Hls.Events.ERROR, (event, data) => {
-          if (data.fatal) {
-            fragCounts[source] = -1;
-          }
-        });
+        probe.attachMedia(pv);
+        probe.on(Hls.Events.FRAG_LOADED, () => { frags[src] += 1; });
+        probe.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) frags[src] = -1; });
       });
 
-      // After STABLE_THRESHOLD (60s), pick the source with the most fragments
       probeTimerRef.current = setTimeout(() => {
-        if (resolved) return;
-
-        const results = Object.entries(fragCounts)
-          .filter(([, count]) => count >= STABLE_MIN_FRAGS)
+        if (!mountedRef.current || resolved) return;
+        const results = Object.entries(frags)
+          .filter(([, c]) => c >= STABLE_MIN_FRAGS)
           .sort(([, a], [, b]) => b - a);
 
         if (results.length > 0) {
           resolved = true;
-          const [bestSource] = results[0];
-          addLog(`${bestSource} stream stable (${fragCounts[bestSource]} fragments in ${STABLE_THRESHOLD / 1000}s). Switching...`, 'success');
+          const [best] = results[0];
+          addLog(`${best} stream stable (${frags[best]} fragments in ${STABLE_THRESHOLD / 1000}s). Switching...`, 'success');
           destroyProbe();
-          failedSourcesRef.current.clear();
-          retryCountRef.current = 0;
-          setRetryDisplay(0);
-          updateSource(bestSource);
-          updateStreamState(STREAM_STATES.CONNECTING);
-          initStream(urlMap[bestSource], bestSource);
+          failedRef.current.clear();
+          dispatch({ type: ACTIONS.PROBE_SUCCESS, source: best });
+          initStream(urlMap[best], best, stateRef.current.activeSlot);
         } else {
           addLog('No stable stream found, will retry...', 'warning');
           destroyProbe();
-          scheduleBackgroundRetry();
+          scheduleProbe();
         }
       }, STABLE_THRESHOLD);
     }, BACKGROUND_RETRY_DELAY);
   };
 
-  const switchToHold = () => {
-    destroyHls();
-    addLog('All streams unavailable. Showing hold screen.', 'error');
-    updateSource('hold');
-    updateStreamState(STREAM_STATES.HOLD);
-    scheduleBackgroundRetry();
-  };
+  // --- Init stream on a specific slot (break-before-make path) ---
+  const initStream = (url, source, targetSlot) => {
+    destroySlot(targetSlot);
+    clearShared();
+    lastFragTimeRef.current = Date.now();
+    playStartRef.current = null;
 
-  const handleStreamError = (errorMessage, isFatal = true) => {
-    addLog(errorMessage, 'error');
-
-    if (!isFatal) return;
-
-    const source = currentSourceRef.current;
-    const retries = retryCountRef.current;
-
-    if (retries < MAX_RETRIES) {
-      retryCountRef.current += 1;
-      setRetryDisplay(retryCountRef.current);
-      addLog(`Retrying ${source} stream (attempt ${retries + 1}/${MAX_RETRIES})...`, 'warning');
-      updateStreamState(STREAM_STATES.CONNECTING);
-
-      clearTimers();
-      retryTimerRef.current = setTimeout(() => {
-        const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
-        initStream(urlMap[source], source);
-      }, RETRY_DELAY);
-    } else {
-      // Record how long this source played before failing
-      if (playbackStartTimeRef.current) {
-        const elapsed = Date.now() - playbackStartTimeRef.current;
-        sourceStabilityRef.current[source] = Math.max(
-          sourceStabilityRef.current[source] || 0,
-          elapsed
-        );
-        addLog(`${source} was stable for ${Math.round(elapsed / 1000)}s`, 'info');
-      }
-      failedSourcesRef.current.add(source);
-
-      // Find best unfailed source, sorted by stability (prefer >60s proven uptime)
-      const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
-      const candidates = ['primary', 'secondary', 'tertiary']
-        .filter(s => !failedSourcesRef.current.has(s) && urlMap[s])
-        .sort((a, b) => {
-          const aMs = sourceStabilityRef.current[a] || 0;
-          const bMs = sourceStabilityRef.current[b] || 0;
-          const aStable = aMs >= STABLE_THRESHOLD;
-          const bStable = bMs >= STABLE_THRESHOLD;
-          if (aStable !== bStable) return bStable - aStable;
-          return bMs - aMs;
-        });
-
-      if (candidates.length > 0) {
-        const next = candidates[0];
-        const stability = sourceStabilityRef.current[next] || 0;
-        const label = stability >= STABLE_THRESHOLD
-          ? `most stable (${Math.round(stability / 1000)}s uptime)`
-          : 'next available';
-        addLog(`Switching to ${next} — ${label}`, 'warning');
-        retryCountRef.current = 0;
-        setRetryDisplay(0);
-        updateSource(next);
-        updateStreamState(STREAM_STATES.CONNECTING);
-        initStream(urlMap[next], next);
-      } else {
-        failedSourcesRef.current.clear();
-        switchToHold();
-      }
-    }
-  };
-
-  const initStream = (url, source) => {
-    destroyHls();
-    bufferErrorCountRef.current = 0;
-    lastFragLoadTimeRef.current = Date.now();
-    playbackStartTimeRef.current = null;
-
-    const videoElement = videoRef.current;
-    if (!videoElement) return;
+    const r = slot(targetSlot);
+    const ve = r.video.current;
+    if (!ve) return;
 
     addLog(`Connecting to ${source} stream...`, 'info');
 
-    // Detect stream ending (e.g. source stops broadcasting — fixes black screen)
-    const handleEnded = () => {
+    const onEnded = () => {
       addLog('Stream ended — source stopped broadcasting', 'warning');
-      handleStreamError('Stream ended', true);
+      handleError(targetSlot, 'Stream ended', true);
     };
-    videoElement.addEventListener('ended', handleEnded);
-    nativeListenersRef.current.push({ element: videoElement, event: 'ended', handler: handleEnded });
+    ve.addEventListener('ended', onEnded);
+    r.listeners.current.push({ element: ve, event: 'ended', handler: onEnded });
 
     if (Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-        backBufferLength: 60,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 60 * 1000 * 1000,
-        maxBufferHole: 1.0,
-        startLevel: -1,
-        abrEwmaDefaultEstimate: 500000,
-        abrBandWidthFactor: 0.8,
-        abrBandWidthUpFactor: 0.4,
-        fragLoadingTimeOut: 20000,
-        fragLoadingMaxRetry: 6,
-        fragLoadingRetryDelay: 2000,
-        manifestLoadingTimeOut: 20000,
-        manifestLoadingMaxRetry: 4,
-        levelLoadingTimeOut: 20000,
-        levelLoadingMaxRetry: 4,
-      });
-      hlsRef.current = hls;
-
+      const hls = new Hls(HLS_CONFIG);
+      r.hls.current = hls;
       hls.loadSource(url);
-      hls.attachMedia(videoElement);
+      hls.attachMedia(ve);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (!mountedRef.current) return;
         addLog('Stream manifest loaded', 'success');
-        playbackStartTimeRef.current = Date.now();
-        lastCurrentTimeRef.current = 0;
-        maxCurrentTimeRef.current = 0;
-        loopCountRef.current = 0;
-
-        // Heartbeat: detect frozen video AND cache loops
-        if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
-        heartbeatTimerRef.current = setInterval(() => {
-          if (!videoRef.current || streamStateRef.current !== STREAM_STATES.PLAYING) return;
-          if (!tabVisibleRef.current) return;
-          const ct = videoRef.current.currentTime;
-
-          // Detect frozen video (currentTime not advancing at all)
-          if (lastCurrentTimeRef.current > 0 && ct === lastCurrentTimeRef.current) {
-            addLog('Heartbeat: playback frozen', 'warning');
-            bufferErrorCountRef.current += 2;
-            if (bufferErrorCountRef.current >= BUFFER_ERROR_THRESHOLD) {
-              bufferErrorCountRef.current = 0;
-              handleStreamError('Stream frozen — video not advancing', true);
-            }
-          }
-          // Detect cache loop (currentTime jumped backwards significantly)
-          else if (maxCurrentTimeRef.current > 0 && ct < maxCurrentTimeRef.current - 3) {
-            loopCountRef.current += 1;
-            addLog(`Cache loop detected — time jumped back (${Math.round(ct)}s < ${Math.round(maxCurrentTimeRef.current)}s, count: ${loopCountRef.current})`, 'warning');
-            if (loopCountRef.current >= 2) {
-              loopCountRef.current = 0;
-              handleStreamError('Stream looping cached content — source likely offline', true);
-            }
-          } else {
-            lastCurrentTimeRef.current = ct;
-            if (ct > maxCurrentTimeRef.current) {
-              maxCurrentTimeRef.current = ct;
-              loopCountRef.current = 0;
-            }
-          }
-        }, 5000);
-
-        attemptPlayback();
+        playStartRef.current = Date.now();
+        attemptPlay(targetSlot);
       });
 
-      hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
-        addLog(`Quality: Level ${data.level}`, 'info');
-      });
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => { addLog(`Quality: Level ${d.level}`, 'info'); });
 
-      hls.on(Hls.Events.ERROR, (event, data) => {
-        const isBufferStall = data.details === 'bufferStalledError' ||
-                              data.details === 'bufferNudgeOnStall';
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (!mountedRef.current) return;
+        const isStall = data.details === 'bufferStalledError' || data.details === 'bufferNudgeOnStall';
 
         if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              handleStreamError(`Network error: ${data.details}`, true);
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              addLog('Media error - attempting recovery...', 'warning');
-              hls.recoverMediaError();
-              break;
-            default:
-              handleStreamError(`Stream error: ${data.details}`, true);
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            addLog('Media error - attempting recovery...', 'warning');
+            hls.recoverMediaError();
+          } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            handleError(targetSlot, `Network error: ${data.details}`, true);
+          } else {
+            handleError(targetSlot, `Stream error: ${data.details}`, true);
           }
-        } else if (isBufferStall) {
-          const timeSinceStart = playbackStartTimeRef.current
-            ? Date.now() - playbackStartTimeRef.current
-            : 0;
-
-          // Grace period: don't trigger fallback during the first STABILITY_WINDOW
-          if (timeSinceStart < STABILITY_WINDOW) {
-            addLog(`Buffer stall (stabilising, ${Math.round((STABILITY_WINDOW - timeSinceStart) / 1000)}s grace remaining)`, 'warning');
+        } else if (isStall) {
+          const since = playStartRef.current ? Date.now() - playStartRef.current : 0;
+          if (since < STABILITY_WINDOW) {
+            addLog(`Buffer stall (stabilising, ${Math.round((STABILITY_WINDOW - since) / 1000)}s grace remaining)`, 'warning');
             return;
           }
-
-          bufferErrorCountRef.current += 1;
-          const timeSinceLastFrag = Date.now() - lastFragLoadTimeRef.current;
-
-          addLog(`Buffer stall (${bufferErrorCountRef.current}/${BUFFER_ERROR_THRESHOLD})`, 'warning');
-
-          if (bufferErrorCountRef.current >= BUFFER_ERROR_THRESHOLD || timeSinceLastFrag > STALL_TIMEOUT) {
-            bufferErrorCountRef.current = 0;
-            handleStreamError('Stream unresponsive - too many buffer stalls', true);
+          r.bufErr.current += 1;
+          const sinceF = Date.now() - lastFragTimeRef.current;
+          addLog(`Buffer stall (${r.bufErr.current}/${BUFFER_ERROR_THRESHOLD})`, 'warning');
+          if (r.bufErr.current >= BUFFER_ERROR_THRESHOLD || sinceF > STALL_TIMEOUT) {
+            r.bufErr.current = 0;
+            handleError(targetSlot, 'Stream unresponsive - too many buffer stalls', true);
           }
         } else {
           addLog(`Minor issue: ${data.details}`, 'warning');
@@ -418,183 +555,291 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
       });
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
-        bufferErrorCountRef.current = 0;
-        lastFragLoadTimeRef.current = Date.now();
-
-        if (stallTimerRef.current) {
-          clearTimeout(stallTimerRef.current);
-        }
-        stallTimerRef.current = setTimeout(() => {
-          if (streamStateRef.current !== STREAM_STATES.PLAYING) return;
-
-          const timeSinceStart = playbackStartTimeRef.current
-            ? Date.now() - playbackStartTimeRef.current
-            : 0;
-          if (timeSinceStart < STABILITY_WINDOW) return;
-
-          handleStreamError('Stream stalled - no data received', true);
+        r.bufErr.current = 0;
+        lastFragTimeRef.current = Date.now();
+        if (r.stall.current) clearTimeout(r.stall.current);
+        r.stall.current = setTimeout(() => {
+          if (!mountedRef.current) return;
+          const st = stateRef.current;
+          if (st.phase !== PHASES.PLAYING && st.phase !== PHASES.SWITCHING) return;
+          const since = playStartRef.current ? Date.now() - playStartRef.current : 0;
+          if (since < STABILITY_WINDOW) return;
+          handleError(targetSlot, 'Stream stalled - no data received', true);
         }, STALL_TIMEOUT);
       });
 
-    } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
-      videoElement.src = url;
-
-      const handleMetadata = () => {
-        addLog('Stream metadata loaded (native HLS)', 'success');
-        attemptPlayback();
-      };
-
-      const handleError = () => {
-        handleStreamError('Native playback error', true);
-      };
-
-      videoElement.addEventListener('loadedmetadata', handleMetadata);
-      videoElement.addEventListener('error', handleError);
-      nativeListenersRef.current.push(
-        { element: videoElement, event: 'loadedmetadata', handler: handleMetadata },
-        { element: videoElement, event: 'error', handler: handleError }
+    } else if (ve.canPlayType('application/vnd.apple.mpegurl')) {
+      ve.src = url;
+      const onMeta = () => { if (mountedRef.current) { addLog('Stream metadata loaded (native HLS)', 'success'); attemptPlay(targetSlot); } };
+      const onErr = () => { handleError(targetSlot, 'Native playback error', true); };
+      ve.addEventListener('loadedmetadata', onMeta);
+      ve.addEventListener('error', onErr);
+      r.listeners.current.push(
+        { element: ve, event: 'loadedmetadata', handler: onMeta },
+        { element: ve, event: 'error', handler: onErr },
       );
     } else {
-      handleStreamError('HLS not supported in this browser', true);
+      handleError(targetSlot, 'HLS not supported in this browser', true);
     }
   };
 
-  useEffect(() => {
-    addLog('Initializing stream player...', 'info');
-    initStream(primaryUrl, 'primary');
+  // --- Make-before-break: load on standby slot ---
+  const initStandby = (url, source) => {
+    const sbSlot = standbySlot();
+    destroySlot(sbSlot);
+    dispatch({ type: ACTIONS.SWITCH_START, source });
 
-    // Pause stall detection when tab is hidden to prevent false positives
-    const handleVisibility = () => {
-      tabVisibleRef.current = !document.hidden;
+    const r = slot(sbSlot);
+    const ve = r.video.current;
+    if (!ve) return;
+
+    addLog(`Pre-loading ${source} on standby...`, 'info');
+    ve.muted = true;
+
+    let ready = false;
+    let gotManifest = false;
+    let gotFrag = false;
+
+    const tryReady = () => {
+      if (ready || !gotManifest || !gotFrag) return;
+      ready = true;
+      ve.play().then(() => {
+        if (mountedRef.current) beginCrossfade(sbSlot);
+      }).catch(() => {
+        if (mountedRef.current) beginCrossfade(sbSlot);
+      });
+    };
+
+    const onEnded = () => { handleError(sbSlot, 'Standby stream ended', true); };
+    ve.addEventListener('ended', onEnded);
+    r.listeners.current.push({ element: ve, event: 'ended', handler: onEnded });
+
+    if (Hls.isSupported()) {
+      const hls = new Hls(HLS_CONFIG);
+      r.hls.current = hls;
+      hls.loadSource(url);
+      hls.attachMedia(ve);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (!mountedRef.current) return;
+        addLog(`Standby ${source}: manifest loaded`, 'success');
+        gotManifest = true;
+        tryReady();
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        if (!gotFrag) {
+          addLog(`Standby ${source}: first fragment loaded`, 'success');
+          gotFrag = true;
+          tryReady();
+        }
+      });
+
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (!mountedRef.current) return;
+        if (d.fatal) handleError(sbSlot, `Standby error: ${d.details}`, true);
+      });
+
+    } else if (ve.canPlayType('application/vnd.apple.mpegurl')) {
+      ve.src = url;
+      const onCanPlay = () => {
+        if (!mountedRef.current) return;
+        addLog(`Standby ${source}: ready (native HLS)`, 'success');
+        gotManifest = true;
+        gotFrag = true;
+        tryReady();
+      };
+      const onErr = () => { handleError(sbSlot, 'Standby native playback error', true); };
+      ve.addEventListener('canplay', onCanPlay);
+      ve.addEventListener('error', onErr);
+      r.listeners.current.push(
+        { element: ve, event: 'canplay', handler: onCanPlay },
+        { element: ve, event: 'error', handler: onErr },
+      );
+    }
+
+    // Safety valve
+    if (switchTimerRef.current) clearTimeout(switchTimerRef.current);
+    switchTimerRef.current = setTimeout(() => {
+      if (!mountedRef.current) return;
+      if (!ready) {
+        addLog('Standby source failed to load in time — falling back', 'warning');
+        handleError(sbSlot, 'Switch timeout — standby not ready', true);
+      }
+    }, SWITCH_TIMEOUT);
+  };
+
+  // --- Crossfade ---
+  const beginCrossfade = (inSlot) => {
+    if (!mountedRef.current) return;
+    if (stateRef.current.phase !== PHASES.SWITCHING) return;
+
+    if (switchTimerRef.current) { clearTimeout(switchTimerRef.current); switchTimerRef.current = null; }
+
+    const outSlot = stateRef.current.activeSlot;
+    const outVid = slot(outSlot).video.current;
+    const inVid = slot(inSlot).video.current;
+
+    if (outVid) outVid.muted = true;
+    if (inVid) inVid.muted = false;
+
+    addLog('Crossfading to new source...', 'info');
+    dispatch({ type: ACTIONS.SWITCH_READY });
+
+    const onEnd = (e) => {
+      if (e.propertyName !== 'opacity') return;
+      inVid.removeEventListener('transitionend', onEnd);
+      finishCrossfade(outSlot);
+    };
+    if (inVid) inVid.addEventListener('transitionend', onEnd);
+
+    // Safety: complete after CROSSFADE_MS + buffer in case transitionend doesn't fire
+    setTimeout(() => {
+      if (!mountedRef.current) return;
+      const s = stateRef.current;
+      if (s.phase === PHASES.SWITCHING && s.crossfading) {
+        if (inVid) inVid.removeEventListener('transitionend', onEnd);
+        finishCrossfade(outSlot);
+      }
+    }, CROSSFADE_MS + 200);
+  };
+
+  const finishCrossfade = (outSlot) => {
+    if (!mountedRef.current) return;
+    addLog('Source switch complete', 'success');
+    destroySlot(outSlot);
+    dispatch({ type: ACTIONS.SWITCH_COMPLETE });
+    playStartRef.current = Date.now();
+    startHeartbeat();
+  };
+
+  // --- Main effect ---
+  useEffect(() => {
+    mountedRef.current = true;
+    addLog('Initializing stream player...', 'info');
+    initStream(primaryUrl, 'primary', 'A');
+
+    const onVis = () => {
+      tabVisRef.current = !document.hidden;
       if (document.hidden) {
         addLog('Tab hidden — pausing stall detection', 'info');
-        if (stallTimerRef.current) {
-          clearTimeout(stallTimerRef.current);
-          stallTimerRef.current = null;
-        }
+        if (stallSlotARef.current) { clearTimeout(stallSlotARef.current); stallSlotARef.current = null; }
+        if (stallSlotBRef.current) { clearTimeout(stallSlotBRef.current); stallSlotBRef.current = null; }
       } else {
         addLog('Tab visible — resuming monitoring', 'info');
-        lastFragLoadTimeRef.current = Date.now();
-        lastCurrentTimeRef.current = videoRef.current?.currentTime || 0;
-        maxCurrentTimeRef.current = videoRef.current?.currentTime || 0;
-        loopCountRef.current = 0;
-        bufferErrorCountRef.current = 0;
+        lastFragTimeRef.current = Date.now();
+        const av = stateRef.current.activeSlot === 'A' ? videoSlotARef.current : videoSlotBRef.current;
+        lastCTRef.current = av?.currentTime || 0;
+        maxCTRef.current = av?.currentTime || 0;
+        loopCntRef.current = 0;
+        bufErrSlotARef.current = 0;
+        bufErrSlotBRef.current = 0;
       }
     };
 
-    // Recover faster when network comes back
-    const handleOnline = () => {
+    const onOnline = () => {
       addLog('Network restored', 'info');
-      if (streamStateRef.current === STREAM_STATES.HOLD ||
-          streamStateRef.current === STREAM_STATES.CONNECTING) {
+      const s = stateRef.current;
+      if (s.phase === PHASES.HOLD || s.phase === PHASES.CONNECTING) {
         addLog('Attempting immediate reconnection...', 'info');
         destroyProbe();
-        clearTimers();
-        failedSourcesRef.current.clear();
-        retryCountRef.current = 0;
-        setRetryDisplay(0);
-        const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
-        const best = ['primary', 'secondary', 'tertiary']
-          .filter(s => urlMap[s])
-          .sort((a, b) => (sourceStabilityRef.current[b] || 0) - (sourceStabilityRef.current[a] || 0));
+        clearShared();
+        failedRef.current.clear();
+        const best = selectBestCandidate(new Set(), stabilityRef.current, urlMap);
         if (best.length > 0) {
-          updateSource(best[0]);
-          updateStreamState(STREAM_STATES.CONNECTING);
-          initStream(urlMap[best[0]], best[0]);
+          dispatch({ type: ACTIONS.CONNECT, source: best[0] });
+          initStream(urlMap[best[0]], best[0], s.activeSlot);
         }
       }
     };
 
-    const handleOffline = () => {
-      addLog('Network lost', 'error');
-    };
+    const onOffline = () => { addLog('Network lost', 'error'); };
 
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
 
     return () => {
-      destroyHls();
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
+      mountedRef.current = false;
+      destroyAll();
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // --- User interaction ---
   const handlePlayClick = () => {
-    attemptPlayback();
-  };
-
-  const getStatusLabel = () => {
-    switch (streamState) {
-      case STREAM_STATES.CONNECTING:
-        return 'Connecting...';
-      case STREAM_STATES.PLAYING:
-        return needsUserInteraction ? 'Ready' : 'Live';
-      case STREAM_STATES.TEAMS:
-        return 'Live (Teams)';
-      case STREAM_STATES.HOLD:
-        return 'Standby';
-      default:
-        return 'Unknown';
+    const s = stateRef.current;
+    const v = slot(s.activeSlot).video.current;
+    if (v) {
+      v.play().then(() => { dispatch({ type: ACTIONS.PLAY_STARTED }); }).catch(() => {});
     }
   };
 
-  const getStatusClass = () => {
-    switch (streamState) {
-      case STREAM_STATES.CONNECTING:
-        return 'status-connecting';
-      case STREAM_STATES.PLAYING:
-        return 'status-connected';
-      case STREAM_STATES.TEAMS:
-        return 'status-teams';
-      case STREAM_STATES.HOLD:
-        return 'status-hold';
-      default:
-        return '';
-    }
+  const toggleTeams = () => {
+    setShowTeams(prev => {
+      const next = !prev;
+      const v = slot(stateRef.current.activeSlot).video.current;
+      if (v) v.muted = next;
+      addLog(next ? 'Switched to Teams view' : 'Switched to HLS player', 'info');
+      return next;
+    });
   };
 
-  const getSourceLabel = () => {
-    switch (currentSource) {
-      case 'primary':
-        return 'Primary (Amazon IVS)';
-      case 'secondary':
-        return 'Backup (MUX)';
-      case 'tertiary':
-        return 'Backup (MediaPackage)';
-      case 'teams':
-        return 'Fallback (Teams)';
-      case 'hold':
-        return 'None active';
-      default:
-        return currentSource;
-    }
-  };
+  // --- Render ---
+  const { phase, activeSlot, crossfading, activeSource, needsUserInteraction, retryCount } = state;
 
-  const showPlayer = streamState === STREAM_STATES.PLAYING;
-  const showTeams = streamState === STREAM_STATES.TEAMS;
-  const showHold = streamState === STREAM_STATES.HOLD;
-  const showConnecting = streamState === STREAM_STATES.CONNECTING;
+  const videoClass = (s) => {
+    if (crossfading && activeSlot === s) return 'video-slot video-fade-out';
+    if (crossfading && activeSlot !== s) return 'video-slot video-fade-in';
+    if (activeSlot === s && (phase === PHASES.PLAYING || phase === PHASES.SWITCHING || phase === PHASES.CONNECTING)) return 'video-slot video-active';
+    return 'video-slot video-standby';
+  };
 
   return (
     <>
+      {teamsUrl && (
+        <div className="source-toggle">
+          <button
+            className={`toggle-btn ${!showTeams ? 'toggle-active' : ''}`}
+            onClick={() => showTeams && toggleTeams()}
+            type="button"
+          >
+            HLS Player
+          </button>
+          <button
+            className={`toggle-btn ${showTeams ? 'toggle-active' : ''}`}
+            onClick={() => !showTeams && toggleTeams()}
+            type="button"
+          >
+            Teams
+          </button>
+        </div>
+      )}
+
       <div className="streaming-wrapper">
         <video
-          ref={videoRef}
-          controls
+          ref={videoSlotARef}
+          className={videoClass('A')}
+          controls={!showTeams && activeSlot === 'A' && phase === PHASES.PLAYING && !needsUserInteraction}
           playsInline
-          className={showPlayer ? '' : 'hidden'}
+        />
+        <video
+          ref={videoSlotBRef}
+          className={videoClass('B')}
+          controls={!showTeams && activeSlot === 'B' && phase === PHASES.PLAYING && !needsUserInteraction}
+          playsInline
         />
 
-        {showTeams && teamsUrl && (
-          <div className="teams-container">
+        {teamsUrl && (
+          <div className={`teams-container ${showTeams ? 'overlay-visible' : 'overlay-hidden'}`}>
             <iframe
               src={teamsUrl}
               title="Teams Live Stream"
-              width="100%"
-              height="100%"
+              width="1280"
+              height="720"
               frameBorder="0"
               scrolling="no"
               allowFullScreen
@@ -603,7 +848,7 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
           </div>
         )}
 
-        <div className={`hold-screen ${showHold ? '' : 'hidden'}`}>
+        <div className={`hold-screen ${!showTeams && phase === PHASES.HOLD ? 'overlay-visible' : 'overlay-hidden'}`}>
           <div className="diagonal-lines">
             <div className="diagonal-line line-cyan-1" />
             <div className="diagonal-line line-purple" />
@@ -618,21 +863,17 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
           </div>
         </div>
 
-        <div className={`connecting-overlay ${showConnecting ? '' : 'hidden'}`}>
+        <div className={`connecting-overlay ${!showTeams && phase === PHASES.CONNECTING ? 'overlay-visible' : 'overlay-hidden'}`}>
           <div className="spinner" />
           <div className="connecting-text">
-            {currentSource === 'primary' && 'Connecting to stream...'}
-            {currentSource === 'secondary' && 'Switching to backup stream...'}
-            {currentSource === 'tertiary' && 'Switching to MediaPackage stream...'}
+            {activeSource === 'primary' && 'Connecting to stream...'}
+            {activeSource === 'secondary' && 'Switching to backup stream...'}
+            {activeSource === 'tertiary' && 'Switching to MediaPackage stream...'}
           </div>
         </div>
 
-        {needsUserInteraction && streamState === STREAM_STATES.PLAYING && (
-          <button
-            className="streaming-play-button"
-            onClick={handlePlayClick}
-            type="button"
-          >
+        {needsUserInteraction && phase === PHASES.PLAYING && (
+          <button className="streaming-play-button" onClick={handlePlayClick} type="button">
             Start Stream
           </button>
         )}
@@ -642,11 +883,7 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
         <div className="debug-panel">
           <div className="debug-header">
             <span className="debug-title">Stream Status</span>
-            <button
-              className="debug-toggle"
-              onClick={() => setIsDebugExpanded(!isDebugExpanded)}
-              type="button"
-            >
+            <button className="debug-toggle" onClick={() => setIsDebugExpanded(!isDebugExpanded)} type="button">
               {isDebugExpanded ? 'Hide Details' : 'Show Details'}
             </button>
           </div>
@@ -654,19 +891,15 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
           <div className="debug-content">
             <div className="debug-item">
               <span className="debug-label">Status</span>
-              <span className={`debug-value ${getStatusClass()}`}>
-                {getStatusLabel()}
-              </span>
+              <span className={`debug-value ${getStatusClass(phase)}`}>{getStatusLabel(phase, needsUserInteraction)}</span>
             </div>
             <div className="debug-item">
               <span className="debug-label">Stream Source</span>
-              <span className="debug-value">{getSourceLabel()}</span>
+              <span className="debug-value">{showTeams ? 'Teams (manual)' : getSourceLabel(activeSource)}</span>
             </div>
             <div className="debug-item">
               <span className="debug-label">Connection Attempts</span>
-              <span className="debug-value">
-                {retryDisplay} / {MAX_RETRIES}
-              </span>
+              <span className="debug-value">{retryCount} / {MAX_RETRIES}</span>
             </div>
           </div>
 

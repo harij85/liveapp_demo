@@ -1,3 +1,40 @@
+/* === Source toggle (HLS / Teams) === */
+.source-toggle {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+
+.toggle-btn {
+  padding: 8px 20px;
+  border: 1px solid #444;
+  background: #1a1a1a;
+  color: #888;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.toggle-btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.toggle-btn:last-child {
+  border-radius: 0 6px 6px 0;
+}
+
+.toggle-btn:hover {
+  border-color: #666;
+  color: #ccc;
+}
+
+.toggle-btn.toggle-active {
+  background: linear-gradient(135deg, #00e5ff 0%, #00a0a0 100%);
+  color: #1a1a1a;
+  border-color: #00a0a0;
+}
+
 .streaming-wrapper {
   position: relative;
   background: #2a2a2a;
@@ -6,23 +43,15 @@
   aspect-ratio: 16 / 9;
 }
 
-.streaming-wrapper video {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  background: #000;
-  display: block;
-}
-
-.streaming-wrapper video.hidden {
-  display: none;
-}
-
-/* Teams iframe container */
+/* === Teams iframe container === */
 .teams-container {
   position: absolute;
   inset: 0;
   background: #000;
+  z-index: 8;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 400ms ease-in-out;
 }
 
 .teams-container iframe {
@@ -31,7 +60,46 @@
   border: none;
 }
 
-/* Hold screen with diagonal lines */
+/* === Dual video slots === */
+.video-slot {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 600ms ease-in-out;
+  z-index: 1;
+}
+
+.video-active {
+  opacity: 1;
+  pointer-events: auto;
+  z-index: 2;
+}
+
+.video-standby {
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.video-fade-in {
+  opacity: 1;
+  pointer-events: auto;
+  z-index: 3;
+}
+
+.video-fade-out {
+  opacity: 0;
+  pointer-events: none;
+  z-index: 2;
+  transition-delay: 200ms;
+}
+
+/* === Hold screen with diagonal lines === */
 .hold-screen {
   position: absolute;
   inset: 0;
@@ -41,13 +109,12 @@
   align-items: flex-end;
   justify-content: flex-end;
   padding: 24px;
+  z-index: 5;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 400ms ease-in-out;
 }
 
-.hold-screen.hidden {
-  display: none;
-}
-
-/* Diagonal lines container */
 .diagonal-lines {
   position: absolute;
   inset: 0;
@@ -129,7 +196,7 @@
   letter-spacing: 0.5px;
 }
 
-/* Connecting overlay */
+/* === Connecting overlay === */
 .connecting-overlay {
   position: absolute;
   inset: 0;
@@ -140,10 +207,21 @@
   justify-content: center;
   gap: 16px;
   color: #fff;
+  z-index: 10;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 400ms ease-in-out;
 }
 
-.connecting-overlay.hidden {
-  display: none;
+/* === Overlay visibility (replaces display:none toggling) === */
+.overlay-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.overlay-hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .spinner {
@@ -165,7 +243,7 @@
   letter-spacing: 0.5px;
 }
 
-/* Play button */
+/* === Play button === */
 .streaming-play-button {
   position: absolute;
   top: 50%;
@@ -193,7 +271,7 @@
   transform: translate(-50%, -50%) scale(0.98);
 }
 
-/* Debug panel */
+/* === Debug panel === */
 .debug-panel {
   margin-top: 16px;
   background: #1a1a1a;
@@ -273,10 +351,6 @@
 
 .status-hold {
   color: #a78bfa;
-}
-
-.status-teams {
-  color: #60a5fa;
 }
 
 /* Log list */
