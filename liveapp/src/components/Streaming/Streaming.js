@@ -37,6 +37,8 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
   const probeVideosRef = useRef([]);
   const heartbeatTimerRef = useRef(null);
   const lastCurrentTimeRef = useRef(0);
+  const maxCurrentTimeRef = useRef(0);
+  const loopCountRef = useRef(0);
   const tabVisibleRef = useRef(true);
 
   const [streamState, setStreamState] = useState(STREAM_STATES.CONNECTING);
@@ -331,13 +333,17 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
         addLog('Stream manifest loaded', 'success');
         playbackStartTimeRef.current = Date.now();
         lastCurrentTimeRef.current = 0;
+        maxCurrentTimeRef.current = 0;
+        loopCountRef.current = 0;
 
-        // Heartbeat: detect frozen video even when buffer looks healthy
+        // Heartbeat: detect frozen video AND cache loops
         if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
         heartbeatTimerRef.current = setInterval(() => {
           if (!videoRef.current || streamStateRef.current !== STREAM_STATES.PLAYING) return;
           if (!tabVisibleRef.current) return;
           const ct = videoRef.current.currentTime;
+
+          // Detect frozen video (currentTime not advancing at all)
           if (lastCurrentTimeRef.current > 0 && ct === lastCurrentTimeRef.current) {
             addLog('Heartbeat: playback frozen', 'warning');
             bufferErrorCountRef.current += 2;
@@ -345,8 +351,21 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
               bufferErrorCountRef.current = 0;
               handleStreamError('Stream frozen — video not advancing', true);
             }
+          }
+          // Detect cache loop (currentTime jumped backwards significantly)
+          else if (maxCurrentTimeRef.current > 0 && ct < maxCurrentTimeRef.current - 3) {
+            loopCountRef.current += 1;
+            addLog(`Cache loop detected — time jumped back (${Math.round(ct)}s < ${Math.round(maxCurrentTimeRef.current)}s, count: ${loopCountRef.current})`, 'warning');
+            if (loopCountRef.current >= 2) {
+              loopCountRef.current = 0;
+              handleStreamError('Stream looping cached content — source likely offline', true);
+            }
           } else {
             lastCurrentTimeRef.current = ct;
+            if (ct > maxCurrentTimeRef.current) {
+              maxCurrentTimeRef.current = ct;
+              loopCountRef.current = 0;
+            }
           }
         }, 5000);
 
@@ -457,6 +476,8 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
         addLog('Tab visible — resuming monitoring', 'info');
         lastFragLoadTimeRef.current = Date.now();
         lastCurrentTimeRef.current = videoRef.current?.currentTime || 0;
+        maxCurrentTimeRef.current = videoRef.current?.currentTime || 0;
+        loopCountRef.current = 0;
         bufferErrorCountRef.current = 0;
       }
     };
