@@ -15,7 +15,6 @@ const STALL_TIMEOUT = 20000;
 const BUFFER_ERROR_THRESHOLD = 5;
 const BACKGROUND_RETRY_DELAY = 30000;
 const STABILITY_WINDOW = 15000;
-const PROBE_MIN_FRAGS = 3;
 const STABLE_THRESHOLD = 60000;
 const STABLE_MIN_FRAGS = 10;
 
@@ -34,6 +33,11 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
   const probeTimerRef = useRef(null);
   const sourceStabilityRef = useRef({ primary: 0, secondary: 0, tertiary: 0 });
   const failedSourcesRef = useRef(new Set());
+  const nativeListenersRef = useRef([]);
+  const probeVideosRef = useRef([]);
+  const heartbeatTimerRef = useRef(null);
+  const lastCurrentTimeRef = useRef(0);
+  const tabVisibleRef = useRef(true);
 
   const [streamState, setStreamState] = useState(STREAM_STATES.CONNECTING);
   const [currentSource, setCurrentSource] = useState('primary');
@@ -70,11 +74,19 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
+    if (heartbeatTimerRef.current) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
   };
 
   const destroyHls = () => {
     clearTimers();
     destroyProbe();
+    nativeListenersRef.current.forEach(({ element, event, handler }) => {
+      element.removeEventListener(event, handler);
+    });
+    nativeListenersRef.current = [];
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
@@ -111,6 +123,11 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
       try { p.destroy(); } catch (e) { /* ignore */ }
     });
     probeHlsRef.current = [];
+    probeVideosRef.current.forEach(v => {
+      v.removeAttribute('src');
+      v.load();
+    });
+    probeVideosRef.current = [];
   };
 
   const scheduleBackgroundRetry = () => {
@@ -151,6 +168,7 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
         probeHlsRef.current.push(probe);
 
         const probeVideo = document.createElement('video');
+        probeVideosRef.current.push(probeVideo);
         probe.loadSource(url);
         probe.attachMedia(probeVideo);
 
@@ -191,14 +209,6 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
         }
       }, STABLE_THRESHOLD);
     }, BACKGROUND_RETRY_DELAY);
-  };
-
-  const switchToTeams = () => {
-    destroyHls();
-    addLog('Switching to Teams backup stream...', 'warning');
-    updateSource('teams');
-    updateStreamState(STREAM_STATES.TEAMS);
-    scheduleBackgroundRetry();
   };
 
   const switchToHold = () => {
@@ -283,6 +293,14 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
 
     addLog(`Connecting to ${source} stream...`, 'info');
 
+    // Detect stream ending (e.g. source stops broadcasting — fixes black screen)
+    const handleEnded = () => {
+      addLog('Stream ended — source stopped broadcasting', 'warning');
+      handleStreamError('Stream ended', true);
+    };
+    videoElement.addEventListener('ended', handleEnded);
+    nativeListenersRef.current.push({ element: videoElement, event: 'ended', handler: handleEnded });
+
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -312,6 +330,26 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         addLog('Stream manifest loaded', 'success');
         playbackStartTimeRef.current = Date.now();
+        lastCurrentTimeRef.current = 0;
+
+        // Heartbeat: detect frozen video even when buffer looks healthy
+        if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+        heartbeatTimerRef.current = setInterval(() => {
+          if (!videoRef.current || streamStateRef.current !== STREAM_STATES.PLAYING) return;
+          if (!tabVisibleRef.current) return;
+          const ct = videoRef.current.currentTime;
+          if (lastCurrentTimeRef.current > 0 && ct === lastCurrentTimeRef.current) {
+            addLog('Heartbeat: playback frozen', 'warning');
+            bufferErrorCountRef.current += 2;
+            if (bufferErrorCountRef.current >= BUFFER_ERROR_THRESHOLD) {
+              bufferErrorCountRef.current = 0;
+              handleStreamError('Stream frozen — video not advancing', true);
+            }
+          } else {
+            lastCurrentTimeRef.current = ct;
+          }
+        }, 5000);
+
         attemptPlayback();
       });
 
@@ -393,6 +431,10 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
 
       videoElement.addEventListener('loadedmetadata', handleMetadata);
       videoElement.addEventListener('error', handleError);
+      nativeListenersRef.current.push(
+        { element: videoElement, event: 'loadedmetadata', handler: handleMetadata },
+        { element: videoElement, event: 'error', handler: handleError }
+      );
     } else {
       handleStreamError('HLS not supported in this browser', true);
     }
@@ -402,8 +444,59 @@ function Streaming({ primaryUrl, secondaryUrl, tertiaryUrl, teamsUrl, showDebug 
     addLog('Initializing stream player...', 'info');
     initStream(primaryUrl, 'primary');
 
+    // Pause stall detection when tab is hidden to prevent false positives
+    const handleVisibility = () => {
+      tabVisibleRef.current = !document.hidden;
+      if (document.hidden) {
+        addLog('Tab hidden — pausing stall detection', 'info');
+        if (stallTimerRef.current) {
+          clearTimeout(stallTimerRef.current);
+          stallTimerRef.current = null;
+        }
+      } else {
+        addLog('Tab visible — resuming monitoring', 'info');
+        lastFragLoadTimeRef.current = Date.now();
+        lastCurrentTimeRef.current = videoRef.current?.currentTime || 0;
+        bufferErrorCountRef.current = 0;
+      }
+    };
+
+    // Recover faster when network comes back
+    const handleOnline = () => {
+      addLog('Network restored', 'info');
+      if (streamStateRef.current === STREAM_STATES.HOLD ||
+          streamStateRef.current === STREAM_STATES.CONNECTING) {
+        addLog('Attempting immediate reconnection...', 'info');
+        destroyProbe();
+        clearTimers();
+        failedSourcesRef.current.clear();
+        retryCountRef.current = 0;
+        setRetryDisplay(0);
+        const urlMap = { primary: primaryUrl, secondary: secondaryUrl, tertiary: tertiaryUrl };
+        const best = ['primary', 'secondary', 'tertiary']
+          .filter(s => urlMap[s])
+          .sort((a, b) => (sourceStabilityRef.current[b] || 0) - (sourceStabilityRef.current[a] || 0));
+        if (best.length > 0) {
+          updateSource(best[0]);
+          updateStreamState(STREAM_STATES.CONNECTING);
+          initStream(urlMap[best[0]], best[0]);
+        }
+      }
+    };
+
+    const handleOffline = () => {
+      addLog('Network lost', 'error');
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
     return () => {
       destroyHls();
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
