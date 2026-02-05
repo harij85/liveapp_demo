@@ -11,7 +11,7 @@ function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <h1>Live Stream</h1>
+        <h1>EMEA EXEC Live Stream Test</h1>
         <span className="header-logo">dentsu</span>
       </header>
       <main className="App-main">

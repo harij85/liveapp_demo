@@ -1,0 +1,17 @@
+version: 1
+frontend:
+    phases:
+        preBuild:
+            commands:
+                - cd liveapp
+                - npm ci
+        build:
+            commands:
+                - npm run build
+    artifacts:
+        baseDirectory: liveapp/build
+        files:
+            - '**/*'
+    cache:
+        paths:
+            - liveapp/node_modules/**/*
